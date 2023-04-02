@@ -1,0 +1,843 @@
+---
+title: "Final Project"
+subtitle: ""
+author: "Keyi Jiang, Freya Wang, Rita Xu"
+date: ""
+output: 
+    pdf_document:
+        number_sections: true    
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE,eval = FALSE)
+
+```
+
+# Load relevant libraries
+
+```{r message=F}
+library(dplyr)
+library(caret)
+#library(glmnet)
+#library(rpart)
+#library(rpart.plot)
+library(ranger)
+#library(dbarts)
+library(gbm)
+library(glmnet)
+#library(ROCR)
+library(readr)
+library(tidyverse)
+library(jsonlite)
+library(h2o)
+library(ggplot2)
+library(tidyr)
+library(tm)
+library(SnowballC)
+library(wordcloud)
+library(RColorBrewer)
+library(syuzhet)
+library(Boruta)
+#library(sjPlot)
+#library(sjmisc)
+#library(sjlabelled)
+library(data.table)
+```
+
+# Load the data
+
+```{r}
+df_meta<-read.csv("~/Desktop/ml/Final project/movie_metadata.csv",header = TRUE)
+df_tmdb<-read.csv("~/Desktop/ml/Final project/tmdb_5000_movies.csv",header = TRUE)
+df_extra<-read.csv("~/Desktop/ml/Final project/extra_data.csv")
+df_extra2<-read.csv("~/Desktop/ml/Final project/movies.csv")
+
+# change column name
+colnames(df_meta)[12] = "title"
+colnames(df_extra)[2]="title"
+colnames(df_extra)[1]="title_year"
+colnames(df_extra)[3]="revenue"
+colnames(df_extra2)[1]="title"
+colnames(df_extra2)[4]="title_year"
+colnames(df_extra2)[13]="revenue"
+
+#leave only year, title and revenue
+df_extra2<- df_extra2 %>% select(c("title","title_year","revenue"))
+
+#tranform "revenue" in df_extra to numeric
+df_extra <- df_extra %>% 
+  mutate(revenue = as.numeric(gsub("\\$|,", "", revenue)))
+```
+
+# Data Processing
+
+```{r, warning=FALSE}
+# remove useless variables & variables that we don't know before the movie is open for consumers
+df_meta = select(df_meta,-c("movie_imdb_link","num_critic_for_reviews","num_voted_users","num_user_for_reviews","imdb_score","aspect_ratio","movie_facebook_likes","gross"))
+df_tmdb = select(df_tmdb,-c("id","original_title","status","vote_average","vote_count","spoken_languages"))
+
+# Load the stringi package
+library(stringi)
+
+# Convert the merging column to lowercase or uppercase in both data frames
+df_meta$title <- tolower(df_meta$title)
+df_tmdb$title <- tolower(df_tmdb$title)
+df_extra$title <- stri_trans_tolower(df_extra$title, locale = "en_US.UTF-8")
+df_extra2$title <- tolower(df_extra2$title)
+
+standartize_title <- function(dt){
+# Remove whitespace and other special characters from the merging column in both data frames
+dt$title<- gsub("[[:punct:]]", "", dt$title)
+
+# Remove rows with missing values in the merging column
+dt <- dt[complete.cases(dt$title), ]
+
+# Convert the encoding of the merging column in both data frames to a common encoding
+dt$title <- iconv(dt$title, from = "UTF-8", to = "ASCII//TRANSLIT")
+
+# Detect the encoding of the merging column in both data frames
+encoding <- guess_encoding(dt$title, n_max = 100)$encoding
+
+# Convert the merging column to a common encoding
+dt$title <- iconv(dt$title, from = encoding, to = "UTF-8")
+
+# Remove leading and trailing whitespace from the merging column
+dt$title <- trimws(dt$title)
+
+# Remove rows with missing values in the merging column
+dt <- dt[complete.cases(dt$title), ]
+
+# Check for and remove any duplicate values in the merging column
+dt <- unique(dt)
+}
+
+for (df_name in c("df_extra", "df_extra2", "df_meta","df_tmdb")) {
+  df <- get(df_name)
+  # apply function
+  df_processed <- standartize_title(df)
+  assign(df_name, df_processed)
+}
+
+df_tmdb <- df_tmdb %>% 
+  separate(release_date, into = c("title_year","month","day"), convert=T)
+df_tmdb = select(df_tmdb,-c("day"))
+
+# Merge the data tables by "title" and "title_year"
+df <- merge(df_meta, df_tmdb, by = c("title","title_year"))
+
+# Remove any duplicate values by "title" and "title_year"
+df <- df[!duplicated(df$title,df$title_year),]
+
+#use extra datasets to impute the missing revenue
+df$revenue <- ifelse(df$revenue == 0, 
+                     df_extra$revenue[match(paste(df$title,df$title_year),
+                                  paste(df_extra$title,df_extra$title_year))], 
+                     df$revenue)
+df$revenue <- ifelse(is.na(df$revenue) == TRUE, 
+                     df_extra2$revenue[match(paste(df$title,df$title_year), 
+                                paste(df_extra2$title,df_extra2$title_year))], 
+                     df$revenue)
+
+#check na
+sum(is.na(df$revenue))
+```
+
+```{r, warning=FALSE}
+# Split production_companies
+## Create an example data frame with a "json_string" column
+df_split <- data.frame(json_string = df$production_companies)
+
+# Define a function to extract the "name" field from a JSON string
+extract_name <- function(json_string) {
+  df_split <- fromJSON(json_string)
+  return(df_split$name)
+}
+
+# Apply the function to the "json_string" column using lapply()
+df$production_companies <- lapply(df_split$json_string, extract_name)
+
+# Remove blank strings
+df[df == ""] <- NA
+df[df == 'NULL'] <- NA
+
+#Extraxt the main production company
+for(i in 1:nrow(df)){
+  df$main_company[i] <- df$production_companies[[i]][1]
+}
+df = select(df,-c("production_companies"))
+
+
+# Replace NA to 0 in duration and runtime
+df$duration <- ifelse(is.na(df$duration), 0, df$duration)
+df$runtime <- ifelse(is.na(df$runtime), 0, df$runtime)
+# Compare duration & runtime
+sum(df$duration == df$runtime, na.rm = TRUE)
+
+for(i in 1:nrow(df)){
+  df$max[i] = max(c(df$duration[i], df$runtime[i]))
+}
+
+# take the average of time as the duration if not 0 value, the maximum of time if 0 value
+df$lasttime = ifelse(df$duration == 0|df$runtime==0, df$max,
+                     rowMeans(df[, c("duration", "runtime")], na.rm = TRUE))
+
+df = select(df,-c("duration", "runtime","max"))
+# delete 0 values in lasttime
+df <- df[df$lasttime != 0, ]
+
+
+# Compare and Split genres.x & genres.y
+# unique(df$genres.x)
+# unique(df$genres.y)
+df = select(df,-c("genres.y")) # genres.y has too many unique values and other useless information such as id
+colnames(df)[9] = "genre"
+# keep the first genre as the main genre
+df <- df %>% 
+  separate(genre,into=c("main_genre"))
+
+# Compare budget.x & budget.y
+sum(df$budget.x == df$budget.y, na.rm = TRUE)
+df = select(df,-c("budget.y")) # budget.y has too many 0 values
+colnames(df)[18] = "budget"
+# delete 0 values in budget
+df <- df[df$budget != 0, ]
+
+
+# Compare language & original_language
+# unique(df$original_language)
+# unique(df$language)
+df = select(df,-c("original_language")) # choose to drop the column which contains vague meaning of language
+
+
+# Compare production_countries & country
+df = select(df,-c("production_countries")) # drop the one with messy format
+# keep only USA movies since we find the monetary unit of budget and revenue is not uniform
+df <- df[df$country == "USA",]
+df = select(df,-c("country"))
+
+
+# Compare and Split plot_keywords & keywords
+# unique(df$plot_keywords)
+# unique(df$keywords)
+# Both contain similar keywords so we use the one with clear format
+df$keyword = strsplit(df$plot_keywords, split = "\\|") 
+df = select(df,-c("plot_keywords","keywords"))
+
+
+#content rating is using two principle: Hays Code and MPAA 
+#passed and approved to be the same-in PG-13 because it's mode
+#reference: https://movies.stackexchange.com/questions/65430/what-are-the-meanings-of-the-terms-passed-and-approved-with-regards-to-a-mov
+#TV-G=G;TV-PG=PG; X=NC-17: not suitable for under 18
+#G--PG--PG13--R(under16-parent)--NC17(no under 16)
+#G--M(parental discretion)--R(under16-parent)--X(no under 16)
+#M=PG:GP=PG(1969-1972)
+#final category: G-PG(M/GP/TV-PG)-PG13(TV-14)-R-NC17(X)
+df <- df %>% mutate(
+    content_rating=case_when(
+    content_rating=="TV-G"|content_rating=="G"           ~"G",
+    content_rating=="M"|content_rating=="GP"|
+    content_rating=="TV-PG"|content_rating=="PG"        ~"PG",
+    content_rating=="TV-14"|content_rating=="Approved"|
+    content_rating=="Passed"|content_rating=="Unrated"|content_rating=="Not Rated"|
+    content_rating=="PG-13"                          ~"PG-13",
+    content_rating=="X"|content_rating=="NC-17"      ~"NC-17",
+    content_rating=="R"                                  ~"R"))
+
+
+# Create dummy variables
+df$homepage <- ifelse(is.na(df$homepage), 0, 1)
+
+# Delete NA values
+df<- na.omit(df)
+
+# Transform character into factor
+df <- df %>%
+  mutate_if(is.character, as.factor)
+
+summary(df$language) # should not include language variable
+df = select(df,-c("language"))
+
+df$homepage <- as.factor(df$homepage)
+
+#str(df)
+```
+
+```{r}
+# log revenue, budget and popularity
+ggplot(df)+
+  geom_histogram(aes(x=revenue), color = "grey")
+ggplot(df)+
+  geom_histogram(aes(x=log(revenue)), color = "grey")
+
+ggplot(df)+
+  geom_histogram(aes(x=budget), color = "grey")
+ggplot(df)+
+  geom_histogram(aes(x=log(budget)), color = "grey")
+
+ggplot(df)+
+  geom_histogram(aes(x=popularity), color = "grey")
+ggplot(df)+
+  geom_histogram(aes(x=log(popularity+1)), color = "grey")
+
+df <- df %>%
+  mutate(log_revenue=log(revenue)) %>%
+  mutate(log_budget=log(budget)) %>%
+  mutate(log_popu=log(popularity+1))
+df = select(df,-c("revenue","budget","popularity"))
+```
+```{r}
+# mutate the length of title, overview and tagline
+df$title_len <- nchar(gsub("[[:punct:][:space:]]", "", df$title))
+df$title_word <- str_count(df$title,"\\S+")
+
+df$ov_len <- nchar(gsub("[[:punct:][:space:]]", "", df$overview))
+df$ov_word <- str_count(df$overview,"\\S+")
+
+df$tag_len <- nchar(gsub("[[:punct:][:space:]]", "", df$tagline))
+df$tag_word <- str_count(df$tagline,"\\S+")
+
+# count keywords
+df$num_keyword <- lengths(df$keyword)
+ggplot(df)+
+  geom_histogram(aes(x=num_keyword)) # the number of keywords may not be useful
+df <- select(df,-c("num_keyword"))
+```
+
+# Sentiment Analysis-Score
+
+## For title
+```{r, warning=FALSE}
+tit <- as.character(df$title)
+titDoc <- Corpus(VectorSource(tit))
+
+# Cleaning up text data
+#Replacing "/", "@" and "|" with space
+toSpace <- content_transformer(function (x , pattern ) gsub(pattern, " ", x))
+titDoc <- tm_map(titDoc, toSpace, "/")
+titDoc <- tm_map(titDoc, toSpace, "@")
+titDoc <- tm_map(titDoc, toSpace, "\\|")
+# Convert the text to lower case
+titDoc <- tm_map(titDoc, content_transformer(tolower))
+# Remove numbers
+titDoc <- tm_map(titDoc, removeNumbers)
+# Remove english common stopwords
+titDoc <- tm_map(titDoc, removeWords, stopwords("english"))
+# Remove punctuations
+titDoc <- tm_map(titDoc, removePunctuation)
+# Eliminate extra white spaces
+titDoc <- tm_map(titDoc, stripWhitespace)
+# Text stemming - which reduces words to their root form
+#titDoc <- tm_map(titDoc, stemDocument)
+
+# Build a term-document matrix
+titDoc_dtm <- TermDocumentMatrix(titDoc)
+dtm_m <- as.matrix(titDoc_dtm)
+# Sort by descearing value of frequency
+dtm_v <- sort(rowSums(dtm_m),decreasing=TRUE)
+dtm_d <- data.frame(word = names(dtm_v),freq=dtm_v)
+# Display the top 5 most frequent words
+head(dtm_d, 5)
+
+
+# Plot the most frequent words
+barplot(dtm_d[1:5,]$freq, las = 2, names.arg = dtm_d[1:5,]$word,
+        col ="lightgreen", main ="Top 5 most frequent words",
+        ylab = "Word frequencies")
+
+#generate word cloud
+set.seed(1)
+wordcloud(words = dtm_d$word, freq = dtm_d$freq, min.freq = 5,
+          max.words=100, random.order=FALSE, rot.per=0.40, 
+          colors=brewer.pal(8, "Dark2"))
+
+# Sentiment Scores
+df$tit_score <- get_sentiment(tit, method="syuzhet")
+head(df$tit_score)
+summary(df$tit_score)
+```
+
+## For overview
+```{r, warning=FALSE}
+ov <- as.character(df$overview)
+ovDoc <- Corpus(VectorSource(ov))
+
+# Cleaning up text data
+#Replacing "/", "@" and "|" with space
+toSpace <- content_transformer(function (x , pattern ) gsub(pattern, " ", x))
+ovDoc <- tm_map(ovDoc, toSpace, "/")
+ovDoc <- tm_map(ovDoc, toSpace, "@")
+ovDoc <- tm_map(ovDoc, toSpace, "\\|")
+# Convert the text to lower case
+ovDoc <- tm_map(ovDoc, content_transformer(tolower))
+# Remove numbers
+ovDoc <- tm_map(ovDoc, removeNumbers)
+# Remove english common stopwords
+ovDoc <- tm_map(ovDoc, removeWords, stopwords("english"))
+# Remove punctuations
+ovDoc <- tm_map(ovDoc, removePunctuation)
+# Eliminate extra white spaces
+ovDoc <- tm_map(ovDoc, stripWhitespace)
+# Text stemming - which reduces words to their root form
+#ovDoc <- tm_map(ovDoc, stemDocument)
+
+# Build a term-document matrix
+ovDoc_dtm <- TermDocumentMatrix(ovDoc)
+dtm_m <- as.matrix(ovDoc_dtm)
+# Sort by descearing value of frequency
+dtm_v <- sort(rowSums(dtm_m),decreasing=TRUE)
+dtm_d <- data.frame(word = names(dtm_v),freq=dtm_v)
+# Display the top 5 most frequent words
+head(dtm_d, 5)
+
+
+# Plot the most frequent words
+barplot(dtm_d[1:5,]$freq, las = 2, names.arg = dtm_d[1:5,]$word,
+        col ="lightgreen", main ="Top 5 most frequent words",
+        ylab = "Word frequencies")
+
+#generate word cloud
+set.seed(1)
+wordcloud(words = dtm_d$word, freq = dtm_d$freq, min.freq = 5,
+          max.words=100, random.order=FALSE, rot.per=0.40, 
+          colors=brewer.pal(8, "Dark2"))
+
+# Sentiment Scores
+df$ov_score <- get_sentiment(ov, method="syuzhet")
+head(df$ov_score)
+summary(df$ov_score)
+```
+
+## For tagline
+```{r, warning=FALSE}
+tag <- as.character(df$tagline)
+tagDoc <- Corpus(VectorSource(tag))
+
+# Cleaning up text data
+#Replacing "/", "@" and "|" with space
+toSpace <- content_transformer(function (x , pattern ) gsub(pattern, " ", x))
+tagDoc <- tm_map(tagDoc, toSpace, "/")
+tagDoc <- tm_map(tagDoc, toSpace, "@")
+tagDoc <- tm_map(tagDoc, toSpace, "\\|")
+# Convert the text to lower case
+tagDoc <- tm_map(tagDoc, content_transformer(tolower))
+# Remove numbers
+tagDoc <- tm_map(tagDoc, removeNumbers)
+# Remove english common stopwords
+tagDoc <- tm_map(tagDoc, removeWords, stopwords("english"))
+# Remove punctuations
+tagDoc <- tm_map(tagDoc, removePunctuation)
+# Eliminate extra white spaces
+tagDoc <- tm_map(tagDoc, stripWhitespace)
+# Text stemming - which reduces words to their root form
+#tagDoc <- tm_map(tagDoc, stemDocument)
+
+# Build a term-document matrix
+tagDoc_dtm <- TermDocumentMatrix(tagDoc)
+dtm_m <- as.matrix(tagDoc_dtm)
+# Sort by descearing value of frequency
+dtm_v <- sort(rowSums(dtm_m),decreasing=TRUE)
+dtm_d <- data.frame(word = names(dtm_v),freq=dtm_v)
+# Display the top 5 most frequent words
+head(dtm_d, 5)
+
+
+# Plot the most frequent words
+barplot(dtm_d[1:5,]$freq, las = 2, names.arg = dtm_d[1:5,]$word,
+        col ="lightgreen", main ="Top 5 most frequent words",
+        ylab = "Word frequencies")
+
+#generate word cloud
+set.seed(1)
+wordcloud(words = dtm_d$word, freq = dtm_d$freq, min.freq = 5,
+          max.words=100, random.order=FALSE, rot.per=0.40, 
+          colors=brewer.pal(8, "Dark2"))
+
+# Sentiment Scores
+df$tag_score <- get_sentiment(tag, method="syuzhet")
+head(df$tag_score)
+summary(df$tag_score)
+```
+
+## For keywords
+```{r,warning=FALSE}
+kw <- as.character(df$keyword)
+kwDoc <- Corpus(VectorSource(kw))
+
+# Cleaning up text data
+#Replacing "/", "@" and "|" with space
+toSpace <- content_transformer(function (x , pattern ) gsub(pattern, " ", x))
+kwDoc <- tm_map(kwDoc, toSpace, "/")
+kwDoc <- tm_map(kwDoc, toSpace, "@")
+kwDoc <- tm_map(kwDoc, toSpace, "\\|")
+# Convert the text to lower case
+kwDoc <- tm_map(kwDoc, content_transformer(tolower))
+# Remove numbers
+kwDoc <- tm_map(kwDoc, removeNumbers)
+# Remove english common stopwords
+kwDoc <- tm_map(kwDoc, removeWords, stopwords("english"))
+# Remove punctuations
+kwDoc <- tm_map(kwDoc, removePunctuation)
+# Eliminate extra white spaces
+kwDoc <- tm_map(kwDoc, stripWhitespace)
+# Text stemming - which reduces words to their root form
+#kwDoc <- tm_map(kwDoc, stemDocument)
+
+# Build a term-document matrix
+kwDoc_dtm <- TermDocumentMatrix(kwDoc)
+dtm_m <- as.matrix(kwDoc_dtm)
+# Sort by descearing value of frequency
+dtm_v <- sort(rowSums(dtm_m),decreasing=TRUE)
+dtm_d <- data.frame(word = names(dtm_v),freq=dtm_v)
+# Display the top 5 most frequent words
+head(dtm_d, 5)
+
+
+# Plot the most frequent words
+barplot(dtm_d[1:5,]$freq, las = 2, names.arg = dtm_d[1:5,]$word,
+        col ="lightgreen", main ="Top 5 most frequent words",
+        ylab = "Word frequencies")
+
+#generate word cloud
+set.seed(1)
+wordcloud(words = dtm_d$word, freq = dtm_d$freq, min.freq = 5,
+          max.words=100, random.order=FALSE, rot.per=0.40, 
+          colors=brewer.pal(8, "Dark2"))
+
+# Sentiment Scores
+df$kw_score <- get_sentiment(kw, method="syuzhet")
+head(df$kw_score)
+summary(df$kw_score)
+```
+# Sentiment Classification
+## For overview
+```{r}
+#ovClass <- get_nrc_sentiment(ov)
+#head (ovClass,10)
+#df <- cbind(df,ovClass)
+```
+
+
+
+# Build Models and Prediction
+## Variable Selection
+### Boruta
+```{r}
+df.all <- df
+df <- select(df, -c("overview","tagline","keyword","title"))
+
+# split data into training and testing set
+set.seed(327)
+N = dim(df)[1]
+train_ratio = 0.6
+train_index = sample(N,train_ratio*N)
+train = df[train_index,]
+test = df[-train_index,]
+
+train.X = select(train, -c("log_revenue"))
+train.y = train$log_revenue
+test.X = select(test, -c("log_revenue"))
+test.y = test$log_revenue
+
+# use boruta to select variables
+boruta <- Boruta(train.X, train.y, doTrace=0)
+plot(boruta)
+
+# Select important features
+#features=names(boruta$finalDecision)[boruta$finalDecision %in% c("Confirmed","Tentative")]
+features = getSelectedAttributes(boruta)
+features
+
+train.red_dim = train[ , c(features, "log_revenue")]
+test.red_dim = test[ , c(features, "log_revenue")]
+```
+
+### Forward Stepwise+BIC
+```{r}
+lgfit.all <- glm(log_revenue~ ., 
+                 data=train, family="gaussian")
+
+lgfit.null <- glm(log_revenue~ 1, 
+                  data=train, family="gaussian")
+
+lgfit.selected <- step(lgfit.null,                  # the starting model for our search
+                       scope=formula(lgfit.all),    # the largest possible model that we will consider.
+                       direction="forward", 
+                       k=log(nrow(train)),       # by default step() uses AIC, but by
+                                                    # multiplying log(n) on the penalty, we get BIC.
+                                                    # See ?step -> Arguments -> k
+                       trace=1)
+summary(lgfit.selected)
+
+pred.lgfit.selected <- predict(lgfit.selected,
+                               newdata = test,
+                               type = "response")
+
+rmse <- sqrt(mean((test$log_revenue - pred.lgfit.selected)^2))
+rmse
+rmse.fw <- rmse
+
+tab_model(lgfit.selected)
+```
+
+### Lasso
+```{r}
+#X.train <- as.matrix(train.X)
+#y.train <- as.matrix(train.y)
+#lasso <- cv.glmnet(X.train, y.train, alpha = 1)
+```
+
+### Random Forest
+```{r}
+hyper_grid <- expand.grid(
+  mtry       = seq(2, 26, by = 2),
+  node_size  = c(5,15,25),
+  sample_size = c(.55, .632, .80),
+  OOB_RMSE   = 0
+)
+
+for(i in 1:nrow(hyper_grid)) {
+  
+  # train model
+  RF <- ranger(
+    formula         = log_revenue ~ .,
+    data            = train,
+    num.trees       = 500,
+    mtry            = hyper_grid$mtry[i],
+    min.node.size   = hyper_grid$node_size[i],
+    sample.fraction = hyper_grid$sample_size[i],
+    seed            = 1108
+  )
+  
+  # add OOB error to grid
+  hyper_grid$OOB_RMSE[i] <- sqrt(RF$prediction.error)
+}
+
+(oo = hyper_grid %>% 
+  dplyr::arrange(OOB_RMSE) %>%
+  head(10))
+```
+
+```{r}
+rf.fit.final <- ranger(
+    formula         = log_revenue ~ ., 
+    data            = train,
+    num.trees       = 500,
+    mtry            = oo[1,]$mtry,
+    min.node.size   = oo[1,]$node_size,
+    sample.fraction = oo[1,]$sample_size,
+    importance      = 'impurity',
+    seed = 1108
+    )
+
+yhat.rf = predict(rf.fit.final, data = test)
+rmse <- sqrt(mean((test$log_revenue - yhat.rf$predictions)^2))
+rmse
+```
+
+Variable Importance
+```{r}
+importance_rf = as.data.table(rf.fit.final$variable.importance, keep.rownames = T)
+sort(rf.fit.final$variable.importance)
+
+rf.select <- c("log_popu","log_budget","title_year","main_genre","actor_3_name","tit_score","main_company","lasttime","cast_total_facebook_likes","director_name")
+train.rf = train[ , c(rf.select, "log_revenue")]
+test.rf = test[ , c(rf.select, "log_revenue")]
+```
+
+
+## Model
+### rf+b selection
+```{r}
+rf.fit.b <- ranger(
+    formula         = log_revenue ~ ., 
+    data            = train.red_dim,
+    num.trees       = 500,
+    mtry            = 10,
+    min.node.size   = 5,
+    sample.fraction = .8,
+    importance      = 'impurity',
+    seed = 1108
+    )
+rmse.rfbtrain<-sqrt(rf.fit.b$prediction.error)
+rmse.rfbtrain
+yhat.rf.b = predict(rf.fit.b, data = test.red_dim)
+rmse.rfb <- sqrt(mean((test$log_revenue - yhat.rf.b$predictions)^2))
+rmse.rfb
+```
+
+### rf+rf selection
+```{r}
+rf.fit.rf <- ranger(
+    formula         = log_revenue ~ ., 
+    data            = train.rf,
+    num.trees       = 500,
+    mtry            = 4,
+    min.node.size   = 4,
+    sample.fraction = .8,
+    importance      = 'impurity',
+    seed = 1108
+    )
+rmse.rfrftrain<-sqrt(rf.fit.rf$prediction.error)
+rmse.rfrftrain
+yhat.rf.rf = predict(rf.fit.rf, data = test.rf)
+rmse.rfrf <- sqrt(mean((test$log_revenue - yhat.rf.rf$predictions)^2))
+rmse.rfrf
+```
+
+# Neural Network
+```{r}
+# Initialize H2O cluster
+h2o.init()
+h2o.removeAll()
+h2o.no_progress()
+
+df_h2o <- as.h2o(df, use_datatable = TRUE)
+train_h2o <- as.h2o(train, use_datatable = TRUE)
+test_h2o <- as.h2o(test, use_datatable = TRUE)
+
+
+# Set response and predictor variables
+response <- "log_revenue"
+predictors <- setdiff(names(train_h2o), response)
+```
+
+```{r}
+# Tuning with Random Search
+hyper_params <- list(
+  activation=c("Rectifier","Tanh","RectifierWithDropout","TanhWithDropout"),
+  hidden=list(c(20,20),c(50,50),c(30,30,30),c(25,25,25,25),c(64,64,64,64)),
+  input_dropout_ratio=c(0,0.05),
+  l1=seq(0,1e-4,1e-6),
+  l2=seq(0,1e-4,1e-6),
+  max_w2=c(5,10,15)
+)
+
+search_criteria = list(
+  strategy = "RandomDiscrete", 
+  max_runtime_secs = 600, 
+  max_models = 100, 
+  seed=1, 
+  stopping_rounds=5,
+  stopping_tolerance=1e-2 # stop once the top 5 models are within 1% of each other
+  )
+
+dl_random_grid <- h2o.grid(
+  algorithm="deeplearning",
+  grid_id = "dl_grid_random",
+  training_frame=train_h2o,
+  nfolds = 5,
+  x=predictors, 
+  y=response,
+  epochs=10,
+  stopping_metric="MSE",
+  score_duty_cycle=0.025, # don't score more than 2.5% of the wall time
+  hyper_params = hyper_params,
+  search_criteria = search_criteria
+)
+summary(dl_random_grid, show_stack_traces = TRUE)
+```
+
+```{r}
+#summary(dl_random_grid, show_stack_traces = TRUE)
+grid <- h2o.getGrid("dl_grid_random", sort_by="RMSE", decreasing=FALSE)
+grid
+
+grid@summary_table[1,]
+
+best_model <- h2o.getModel(grid@model_ids[[1]]) ## model with lowest RMSE
+best_model
+
+plot(best_model)
+importance <- summary(best_model)[1:10,]
+importance
+h2o.varimp_plot(best_model)
+```
+
+```{r}
+best_perf <- h2o.performance(best_model, newdata=test_h2o) # prediction
+best_perf
+
+h2o.rmse(best_perf) # report RMSE on the test data
+```
+
+# Extract deep features using the best model selected above
+
+```{r}
+l <- as.numeric(str_extract_all(grid@summary_table[1,"hidden"], "[0-9]+")[[1]])
+
+trainX.deep.features = h2o::h2o.deepfeatures(best_model, train_h2o[,predictors], layer = length(l))
+testX.deep.features = h2o::h2o.deepfeatures(best_model, test_h2o[,predictors], layer = length(l))
+
+dim(trainX.deep.features)
+```
+
+# Random Forest
+
+```{r}
+train_reduced <- h2o.cbind(trainX.deep.features, train_h2o[,response])
+
+drf <- h2o.randomForest(x = 1:dim(trainX.deep.features)[2],
+                        y = dim(trainX.deep.features)[2]+1, 
+                        training_frame = train_reduced,
+                        nfolds = 5,
+                        ntrees = 500,
+                        min_rows = 3,
+                        stopping_rounds = 5,
+                        stopping_metric="MSE",
+                        model_id = "drf_features1",
+                        seed = 1)
+drf
+
+plot(drf)
+```
+
+```{r}
+test_reduced <- h2o.cbind(testX.deep.features, test_h2o[,response])
+
+drf_perf <- h2o.performance(drf, newdata = test_reduced) # prediction
+drf_perf
+
+h2o.rmse(drf_perf) # report RMSE
+```
+
+# Boosting
+
+```{r}
+boost <- h2o.gbm(x = 1:dim(trainX.deep.features)[2],
+                 y = dim(trainX.deep.features)[2]+1,
+                 training_frame = train_reduced,
+                 nfolds = 5,
+                 ntrees = 500,
+                 max_depth = 5,
+                 min_rows = 5,
+                 learn_rate = 0.01,
+                 sample_rate = 0.5,
+                 col_sample_rate = 0.6,
+                 stopping_metric="MSE",
+                 stopping_rounds = 5,
+                 model_id = "boost_features1",
+                 seed = 1)
+boost
+
+plot(boost)
+```
+
+```{r}
+boost_perf <- h2o.performance(boost, newdata = test_reduced) # prediction
+boost_perf
+
+h2o.rmse(boost_perf) # report RMSE
+h2o.varimp_plot(boost)
+```
+```
+
+
+```{r}
+h2o.shutdown()
+```
+
+
+
