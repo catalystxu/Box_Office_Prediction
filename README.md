@@ -1,6 +1,6 @@
-# Box Office Prediction
-Project title: Predicting a Movie’s Popularity and Box Office Revenue Using 5000 Movie Database from TMDB and IMDB
-Team members: Keyi Jiang, Freya Wang, Rita Xu
+# Box Office Prediction Proposal
+Project title: Predicting a Movie’s Box Office Using 5000 Movie Database from TMDB and IMDB
+
 Data Set:
 - Description: For this project, we are using the data set from TMDB 5000 Movie Dataset and IMDB 5000 Movie Dataset from two mainstream movie rating and review websites. These two datasets contain multiple facets of information about the top 5000 movies including numeric data like budget, category data including issue company, crew information, genre and keyword tag, text data including plot overview and reviews, and etc. Two datasets we are using are slightly different in some columns and we plan to merge them when needed.
 - data set 1 from TMBD:
